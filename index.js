@@ -70,7 +70,7 @@ async function connectDB() {
   if (!connectionPromise) {
     connectionPromise = (async () => {
       mongoClient = new MongoClient(uri, {
-        serverSelectionTimeoutMS: 10000,
+        serverSelectionTimeoutMS: 4000,
         serverApi: {
           version: ServerApiVersion.v1,
           strict: true,
@@ -760,9 +760,159 @@ function serializeEquipment(doc) {
   };
 }
 
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // ---------------------------------------------------------------------------
 // 5. Public Home & Discovery Routes
 // ---------------------------------------------------------------------------
+app.get(
+  "/api/equipment",
+  asyncHandler(async (req, res) => {
+    const {
+      search = "",
+      category = "",
+      rentalType = "",
+      minPrice = "",
+      maxPrice = "",
+      availability = "",
+      sort = "recent",
+      page = "1",
+      limit = "6",
+    } = req.query;
+
+    const parsedPage = Math.max(1, parseInt(String(page), 10) || 1);
+    const parsedLimit = Math.min(24, Math.max(1, parseInt(String(limit), 10) || 6));
+    const trimmedSearch = String(search || "").trim();
+    const trimmedCategory = String(category || "").trim();
+    const trimmedRentalType = String(rentalType || "").trim();
+    const minP = minPrice !== "" && !Number.isNaN(Number(minPrice)) ? Number(minPrice) : null;
+    const maxP = maxPrice !== "" && !Number.isNaN(Number(maxPrice)) ? Number(maxPrice) : null;
+
+    try {
+      const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+      const query = { status: "Approved" };
+
+      if (trimmedSearch) {
+        const rx = new RegExp(escapeRegex(trimmedSearch), "i");
+        query.$or = [
+          { name: rx },
+          { location: rx },
+          { category: rx },
+          { brand: rx },
+        ];
+      }
+
+      if (trimmedCategory && trimmedCategory !== "All") {
+        query.category = trimmedCategory;
+      }
+
+      if (trimmedRentalType && trimmedRentalType !== "All") {
+        query.rentalType = trimmedRentalType;
+      }
+
+      if (minP !== null || maxP !== null) {
+        query.rentalPrice = {};
+        if (minP !== null) query.rentalPrice.$gte = minP;
+        if (maxP !== null) query.rentalPrice.$lte = maxP;
+      }
+
+      if (availability === "available") {
+        query.availableQuantity = { $gt: 0 };
+      } else if (availability === "unavailable") {
+        query.availableQuantity = { $lte: 0 };
+      }
+
+      let sortStage = { createdAt: -1 };
+      if (sort === "price_asc") sortStage = { rentalPrice: 1, createdAt: -1 };
+      else if (sort === "price_desc") sortStage = { rentalPrice: -1, createdAt: -1 };
+
+      const total = await equipmentCol.countDocuments(query);
+      const totalPages = Math.max(1, Math.ceil(total / parsedLimit));
+      const safePage = Math.min(parsedPage, totalPages);
+
+      const docs = await equipmentCol
+        .find(query)
+        .sort(sortStage)
+        .skip((safePage - 1) * parsedLimit)
+        .limit(parsedLimit)
+        .toArray();
+
+      return res.status(200).json({
+        success: true,
+        items: docs.map(serializeEquipment),
+        pagination: {
+          total,
+          page: safePage,
+          limit: parsedLimit,
+          totalPages,
+        },
+      });
+    } catch {
+      // Fallback filtering/sorting/pagination if DB is offline
+      let filtered = DEFAULT_SEED_EQUIPMENT.map((item, idx) =>
+        serializeEquipment({
+          ...item,
+          id: `seed-${idx + 1}`,
+          createdAt: new Date(Date.now() - idx * 86400000),
+        })
+      );
+
+      if (trimmedSearch) {
+        const lower = trimmedSearch.toLowerCase();
+        filtered = filtered.filter(
+          (i) =>
+            i.name.toLowerCase().includes(lower) ||
+            i.location.toLowerCase().includes(lower) ||
+            i.category.toLowerCase().includes(lower) ||
+            (i.brand || "").toLowerCase().includes(lower)
+        );
+      }
+
+      if (trimmedCategory && trimmedCategory !== "All") {
+        filtered = filtered.filter((i) => i.category === trimmedCategory);
+      }
+      if (trimmedRentalType && trimmedRentalType !== "All") {
+        filtered = filtered.filter((i) => i.rentalType === trimmedRentalType);
+      }
+      if (minP !== null) {
+        filtered = filtered.filter((i) => i.rentalPrice >= minP);
+      }
+      if (maxP !== null) {
+        filtered = filtered.filter((i) => i.rentalPrice <= maxP);
+      }
+      if (availability === "available") {
+        filtered = filtered.filter((i) => i.availableQuantity > 0);
+      } else if (availability === "unavailable") {
+        filtered = filtered.filter((i) => i.availableQuantity <= 0);
+      }
+
+      if (sort === "price_asc") {
+        filtered.sort((a, b) => a.rentalPrice - b.rentalPrice);
+      } else if (sort === "price_desc") {
+        filtered.sort((a, b) => b.rentalPrice - a.rentalPrice);
+      }
+
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / parsedLimit));
+      const safePage = Math.min(parsedPage, totalPages);
+      const start = (safePage - 1) * parsedLimit;
+
+      return res.status(200).json({
+        success: true,
+        fallback: true,
+        items: filtered.slice(start, start + parsedLimit),
+        pagination: {
+          total,
+          page: safePage,
+          limit: parsedLimit,
+          totalPages,
+        },
+      });
+    }
+  })
+);
 app.get(
   "/api/equipment/featured",
   asyncHandler(async (_req, res) => {
