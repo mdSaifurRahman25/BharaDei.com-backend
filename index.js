@@ -3,6 +3,7 @@ import cors from "cors";
 import "dotenv/config";
 import { connectDB, isDBConnected } from "./config/db.js";
 import healthRoutes from "./routes/health.routes.js";
+import authRoutes from "./routes/auth.routes.js";
 import { globalErrorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 
 const app = express();
@@ -48,6 +49,7 @@ app.get("/", (_req, res) => {
 });
 
 app.use("/api", healthRoutes);
+app.use("/api/auth", authRoutes);
 
 app.use(notFoundHandler);
 app.use(globalErrorHandler);
