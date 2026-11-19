@@ -70,6 +70,7 @@ async function connectDB() {
   if (!connectionPromise) {
     connectionPromise = (async () => {
       mongoClient = new MongoClient(uri, {
+        serverSelectionTimeoutMS: 10000,
         serverApi: {
           version: ServerApiVersion.v1,
           strict: true,
@@ -508,14 +509,12 @@ app.use((err, req, res, _next) => {
 });
 
 async function startServer() {
-  try {
-    await connectDB();
-  } catch (err) {
-    console.error("[DB] Initial MongoDB connection failed:", err.message);
-  }
-
   app.listen(port, () => {
     console.log(`BharaDei.com server running at http://localhost:${port}`);
+  });
+
+  connectDB().catch((err) => {
+    console.error("[DB] Initial MongoDB connection failed:", err.message);
   });
 }
 
