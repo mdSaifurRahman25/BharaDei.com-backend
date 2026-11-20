@@ -1629,7 +1629,76 @@ app.post(
 );
 
 // ---------------------------------------------------------------------------
-// 8. 404 & Global Error Handlers
+// 8. Customer Dashboard Routes
+// ---------------------------------------------------------------------------
+app.get(
+  "/api/customer/rentals",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const parsedPage = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const parsedLimit = Math.min(25, Math.max(1, parseInt(String(req.query.limit || "8"), 10) || 8));
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const filter = { customerEmail: req.user.email };
+
+    const [total, allForSummary] = await Promise.all([
+      bookingsCol.countDocuments(filter),
+      bookingsCol
+        .find(filter, { projection: { bookingStatus: 1, paymentStatus: 1, totalAmount: 1 } })
+        .toArray(),
+    ]);
+
+    const totalPages = Math.max(1, Math.ceil(total / parsedLimit));
+    const safePage = Math.min(parsedPage, totalPages);
+
+    const docs = await bookingsCol
+      .find(filter)
+      .sort({ bookingDate: -1, createdAt: -1 })
+      .skip((safePage - 1) * parsedLimit)
+      .limit(parsedLimit)
+      .toArray();
+
+    const summary = allForSummary.reduce(
+      (acc, b) => {
+        acc.totalBookings += 1;
+        if (b.bookingStatus === "Confirmed") acc.activeRentals += 1;
+        if (b.bookingStatus === "Completed") acc.completedRentals += 1;
+        if (b.paymentStatus === "Paid") acc.totalSpent += Number(b.totalAmount || 0);
+        return acc;
+      },
+      { totalBookings: 0, activeRentals: 0, completedRentals: 0, totalSpent: 0 }
+    );
+
+    return res.status(200).json({
+      success: true,
+      rentals: docs.map((b) => ({
+        id: String(b._id),
+        equipmentId: b.equipmentId,
+        equipmentName: b.equipmentName,
+        equipmentCategory: b.equipmentCategory || "",
+        equipmentImage: b.equipmentImage || "",
+        startDate: b.startDate,
+        endDate: b.endDate,
+        bookingDate: b.bookingDate || b.createdAt,
+        quantity: Number(b.quantity || 1),
+        totalAmount: Number(b.totalAmount || 0),
+        paymentStatus: b.paymentStatus || "Pending",
+        bookingStatus: b.bookingStatus || "Pending",
+      })),
+      summary,
+      pagination: {
+        total,
+        page: safePage,
+        limit: parsedLimit,
+        totalPages,
+      },
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 9. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
