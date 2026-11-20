@@ -1190,6 +1190,134 @@ app.post(
   })
 );
 
+app.get(
+  "/api/favorites",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const favoritesCol = await getCollection(COLLECTIONS.FAVORITES);
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+
+    const favDocs = await favoritesCol
+      .find({ userEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const objectIds = favDocs
+      .map((f) => f.equipmentId)
+      .filter((id) => ObjectId.isValid(id))
+      .map((id) => new ObjectId(id));
+
+    const equipDocs = objectIds.length
+      ? await equipmentCol.find({ _id: { $in: objectIds } }).toArray()
+      : [];
+    const equipMap = new Map(equipDocs.map((e) => [String(e._id), serializeEquipment(e)]));
+
+    const favorites = favDocs.map((f) => ({
+      id: String(f._id),
+      equipmentId: f.equipmentId,
+      createdAt: f.createdAt,
+      equipment: equipMap.get(f.equipmentId) || f.equipmentSnapshot || null,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      favorites,
+    });
+  })
+);
+
+app.get(
+  "/api/favorites/check/:equipmentId",
+  verifyToken,
+  asyncHandler(async (req, res) => {
+    const { equipmentId } = req.params;
+    const favoritesCol = await getCollection(COLLECTIONS.FAVORITES);
+    const existing = await favoritesCol.findOne({
+      userEmail: req.user.email,
+      equipmentId,
+    });
+
+    return res.status(200).json({
+      success: true,
+      isFavorite: Boolean(existing),
+    });
+  })
+);
+
+app.post(
+  "/api/favorites",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const { equipmentId } = req.body || {};
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid equipmentId is required.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const equipment = await equipmentCol.findOne({
+      _id: new ObjectId(equipmentId),
+    });
+    if (!equipment) {
+      return res.status(404).json({
+        success: false,
+        message: "Equipment not found.",
+      });
+    }
+
+    const favoritesCol = await getCollection(COLLECTIONS.FAVORITES);
+    const existing = await favoritesCol.findOne({
+      userEmail: req.user.email,
+      equipmentId,
+    });
+
+    if (existing) {
+      return res.status(200).json({
+        success: true,
+        message: "Already in your favorites.",
+        isFavorite: true,
+      });
+    }
+
+    await favoritesCol.insertOne({
+      userEmail: req.user.email,
+      equipmentId,
+      equipmentSnapshot: serializeEquipment(equipment),
+      createdAt: new Date(),
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Added to favorites.",
+      isFavorite: true,
+    });
+  })
+);
+
+app.delete(
+  "/api/favorites/:equipmentId",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const { equipmentId } = req.params;
+    const favoritesCol = await getCollection(COLLECTIONS.FAVORITES);
+    await favoritesCol.deleteOne({
+      userEmail: req.user.email,
+      equipmentId,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Removed from favorites.",
+      isFavorite: false,
+    });
+  })
+);
+
 // ---------------------------------------------------------------------------
 // 7. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
