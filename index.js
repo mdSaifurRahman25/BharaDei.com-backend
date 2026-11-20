@@ -1469,6 +1469,165 @@ app.post(
   })
 );
 
+app.post(
+  "/api/payments/verify",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    if (!stripe) {
+      return res.status(503).json({
+        success: false,
+        message: "Stripe payment gateway is not configured.",
+      });
+    }
+
+    const { sessionId } = req.body || {};
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Valid Stripe sessionId is required.",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session || session.payment_status !== "paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Stripe payment has not been completed yet.",
+      });
+    }
+
+    const bookingId = session.metadata?.bookingId;
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing booking reference in Stripe session.",
+      });
+    }
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const paymentsCol = await getCollection(COLLECTIONS.PAYMENTS);
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+
+    const booking = await bookingsCol.findOne({ _id: new ObjectId(bookingId) });
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking record not found.",
+      });
+    }
+    if (booking.customerEmail !== req.user.email) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Booking belongs to another customer.",
+      });
+    }
+
+    // Idempotent check if already verified
+    const existingPayment = await paymentsCol.findOne({ sessionId: session.id });
+    if (existingPayment) {
+      return res.status(200).json({
+        success: true,
+        message: "Payment already verified.",
+        booking: { id: String(booking._id), ...booking },
+        payment: { id: String(existingPayment._id), ...existingPayment },
+      });
+    }
+
+    const now = new Date();
+    const transactionId = String(session.payment_intent || session.id);
+
+    const paymentDoc = {
+      sessionId: session.id,
+      transactionId,
+      bookingId: String(booking._id),
+      equipmentId: booking.equipmentId,
+      equipmentName: booking.equipmentName,
+      customerEmail: booking.customerEmail,
+      customerName: booking.customerName,
+      ownerEmail: booking.ownerEmail || "",
+      amount: Number(booking.totalAmount),
+      currency: String(session.currency || "bdt").toUpperCase(),
+      paymentStatus: "Paid",
+      paymentMethod: "Stripe Checkout",
+      paidAt: now,
+      createdAt: now,
+    };
+
+    const paymentInsert = await paymentsCol.insertOne(paymentDoc);
+
+    const updatedBooking = await bookingsCol.findOneAndUpdate(
+      { _id: booking._id },
+      {
+        $set: {
+          paymentStatus: "Paid",
+          bookingStatus: "Confirmed",
+          paymentIntentId: transactionId,
+          paidAt: now,
+          updatedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (ObjectId.isValid(booking.equipmentId)) {
+      await equipmentCol.updateOne(
+        {
+          _id: new ObjectId(booking.equipmentId),
+          availableQuantity: { $gte: Number(booking.quantity || 1) },
+        },
+        {
+          $inc: {
+            availableQuantity: -Number(booking.quantity || 1),
+            rentalCount: Number(booking.quantity || 1),
+          },
+          $set: { updatedAt: now },
+        }
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment verified and booking confirmed!",
+      booking: { id: String(updatedBooking._id), ...updatedBooking },
+      payment: { id: String(paymentInsert.insertedId), ...paymentDoc },
+    });
+  })
+);
+
+app.post(
+  "/api/payments/cancel",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const { bookingId } = req.body || {};
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(200).json({ success: true, message: "Cancelled." });
+    }
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    await bookingsCol.updateOne(
+      {
+        _id: new ObjectId(bookingId),
+        customerEmail: req.user.email,
+        paymentStatus: "Pending",
+      },
+      {
+        $set: {
+          paymentStatus: "Cancelled",
+          bookingStatus: "Cancelled",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Pending booking marked as cancelled.",
+    });
+  })
+);
+
 // ---------------------------------------------------------------------------
 // 8. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
