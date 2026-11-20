@@ -4,6 +4,11 @@ import "dotenv/config";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import Stripe from "stripe";
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -1319,7 +1324,153 @@ app.delete(
 );
 
 // ---------------------------------------------------------------------------
-// 7. 404 & Global Error Handlers
+// 7. Stripe Payment & Booking Confirmation Routes
+// ---------------------------------------------------------------------------
+function getClientOrigin(req) {
+  const reqOrigin = req.headers.origin?.trim();
+  if (reqOrigin && allowedOrigins.has(reqOrigin)) {
+    return reqOrigin;
+  }
+  return (process.env.CLIENT_URL || "http://localhost:3000").replace(/\/+$/, "");
+}
+
+app.post(
+  "/api/payments/create-checkout-session",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    if (!stripe) {
+      return res.status(503).json({
+        success: false,
+        message: "Stripe payment gateway is not configured on the server.",
+      });
+    }
+
+    const {
+      equipmentId,
+      startDate,
+      endDate,
+      quantity,
+      contactNumber,
+      deliveryAddress,
+      notes = "",
+    } = req.body || {};
+
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid equipment ID.",
+      });
+    }
+    if (!contactNumber?.trim() || !deliveryAddress?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Contact number and delivery address are required.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const equipment = await equipmentCol.findOne({
+      _id: new ObjectId(equipmentId),
+      status: "Approved",
+    });
+
+    if (!equipment) {
+      return res.status(404).json({
+        success: false,
+        message: "Approved equipment listing not found.",
+      });
+    }
+
+    const quote = calculateRentalQuote(equipment, startDate, endDate, quantity);
+    if (quote.error) {
+      return res.status(400).json({
+        success: false,
+        message: quote.error,
+      });
+    }
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const now = new Date();
+    const bookingDoc = {
+      customerId: req.user.id,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      ownerEmail: equipment.ownerEmail || "",
+      ownerName: equipment.ownerName || "Verified Owner",
+      equipmentId: String(equipment._id),
+      equipmentName: equipment.name,
+      equipmentCategory: equipment.category,
+      equipmentImage: equipment.image || "",
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      days: quote.days,
+      billingUnits: quote.billingUnits,
+      rentalType: quote.rentalType,
+      quantity: quote.quantity,
+      totalAmount: quote.totalAmount,
+      contactNumber: contactNumber.trim(),
+      deliveryAddress: deliveryAddress.trim(),
+      notes: typeof notes === "string" ? notes.trim() : "",
+      paymentStatus: "Pending",
+      bookingStatus: "Pending",
+      bookingDate: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const bookingInsert = await bookingsCol.insertOne(bookingDoc);
+    const bookingId = String(bookingInsert.insertedId);
+    const clientOrigin = getClientOrigin(req);
+
+    try {
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        customer_email: req.user.email,
+        line_items: [
+          {
+            price_data: {
+              currency: "bdt",
+              product_data: {
+                name: equipment.name,
+                description: `${quote.quantity} unit(s) · ${quote.days} day(s) (${quote.rentalType})`,
+                ...(equipment.image ? { images: [equipment.image] } : {}),
+              },
+              unit_amount: Math.round(quote.totalAmount * 100),
+            },
+            quantity: 1,
+          },
+        ],
+        metadata: {
+          bookingId,
+          equipmentId: String(equipment._id),
+          customerEmail: req.user.email,
+        },
+        success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientOrigin}/payment/cancel?booking_id=${bookingId}`,
+      });
+
+      await bookingsCol.updateOne(
+        { _id: bookingInsert.insertedId },
+        { $set: { stripeSessionId: session.id, updatedAt: new Date() } }
+      );
+
+      return res.status(200).json({
+        success: true,
+        sessionId: session.id,
+        url: session.url,
+        bookingId,
+      });
+    } catch (stripeErr) {
+      await bookingsCol.deleteOne({ _id: bookingInsert.insertedId });
+      throw stripeErr;
+    }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 8. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
