@@ -261,25 +261,30 @@ function asyncHandler(fn) {
 // ---------------------------------------------------------------------------
 // 4. Health & Auth Routes
 // ---------------------------------------------------------------------------
-app.get("/", (_req, res) => {
+async function ensureDbConnected() {
+  if (database) return true;
+  if (!process.env.MONGODB_URI) return false;
+  try {
+    const db = await connectDB();
+    return Boolean(db);
+  } catch {
+    return false;
+  }
+}
+
+app.get("/", async (_req, res) => {
+  const dbConnected = await ensureDbConnected();
+
   res.status(200).json({
     success: true,
     name: "BharaDei.com API",
     message: "BharaDei.com Equipment Rental API is running.",
-    dbConnected: Boolean(database),
+    dbConnected,
   });
 });
 
 app.get("/api/health", async (_req, res) => {
-  let dbConnected = Boolean(database);
-  if (!dbConnected && process.env.MONGODB_URI) {
-    try {
-      const db = await connectDB();
-      dbConnected = Boolean(db);
-    } catch {
-      dbConnected = false;
-    }
-  }
+  const dbConnected = await ensureDbConnected();
 
   res.status(200).json({
     success: true,
