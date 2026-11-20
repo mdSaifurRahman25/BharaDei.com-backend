@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient, ServerApiVersion } from "mongodb";
+import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 
@@ -1048,8 +1048,150 @@ app.get(
   })
 );
 
+function calculateRentalQuote(equipment, startDateStr, endDateStr, quantity) {
+  const start = new Date(startDateStr);
+  const end = new Date(endDateStr);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return { error: "Please provide valid start and end dates." };
+  }
+  if (end < start) {
+    return { error: "Rental end date must be on or after the start date." };
+  }
+
+  const qty = Number(quantity);
+  if (!Number.isInteger(qty) || qty < 1) {
+    return { error: "Required quantity must be at least 1." };
+  }
+  if (qty > Number(equipment.availableQuantity || 0)) {
+    return {
+      error: `Only ${equipment.availableQuantity} unit(s) currently available.`,
+    };
+  }
+
+  const diffDays = Math.ceil((end.getTime() - start.getTime()) / 86400000);
+  const days = Math.max(1, diffDays);
+
+  let billingUnits = days;
+  if (equipment.rentalType === "Weekly") {
+    billingUnits = Math.max(1, Math.ceil(days / 7));
+  } else if (equipment.rentalType === "Monthly") {
+    billingUnits = Math.max(1, Math.ceil(days / 30));
+  }
+
+  const unitPrice = Number(equipment.rentalPrice || 0);
+  const totalAmount = billingUnits * unitPrice * qty;
+
+  return {
+    days,
+    billingUnits,
+    unitPrice,
+    quantity: qty,
+    rentalType: equipment.rentalType || "Daily",
+    totalAmount,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// 6. 404 & Global Error Handlers
+// 6. Equipment Details, Favorites & Booking Validation (Private Routes)
+// ---------------------------------------------------------------------------
+app.get(
+  "/api/equipment/:id",
+  verifyToken,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid equipment ID.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const doc = await equipmentCol.findOne({ _id: new ObjectId(id) });
+
+    if (!doc) {
+      return res.status(404).json({
+        success: false,
+        message: "Equipment listing not found.",
+      });
+    }
+
+    if (
+      doc.status !== "Approved" &&
+      req.user.role !== "Admin" &&
+      doc.ownerEmail !== req.user.email
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "This equipment listing is not publicly approved yet.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      equipment: serializeEquipment(doc),
+    });
+  })
+);
+
+app.post(
+  "/api/bookings/validate",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const {
+      equipmentId,
+      startDate,
+      endDate,
+      quantity,
+      contactNumber,
+      deliveryAddress,
+    } = req.body || {};
+
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid equipment ID.",
+      });
+    }
+    if (!contactNumber?.trim() || !deliveryAddress?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Contact number and delivery address are required.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const equipment = await equipmentCol.findOne({
+      _id: new ObjectId(equipmentId),
+      status: "Approved",
+    });
+
+    if (!equipment) {
+      return res.status(404).json({
+        success: false,
+        message: "Approved equipment listing not found.",
+      });
+    }
+
+    const quote = calculateRentalQuote(equipment, startDate, endDate, quantity);
+    if (quote.error) {
+      return res.status(400).json({
+        success: false,
+        message: quote.error,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      quote,
+      equipment: serializeEquipment(equipment),
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 7. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
