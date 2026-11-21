@@ -2648,9 +2648,11 @@ app.use((err, req, res, _next) => {
 });
 
 async function startServer() {
-  app.listen(port, () => {
-    console.log(`BharaDei.com server running at http://localhost:${port}`);
-  });
+  if (!process.env.VERCEL) {
+    app.listen(port, () => {
+      console.log(`BharaDei.com server running at http://localhost:${port}`);
+    });
+  }
 
   connectDB().catch((err) => {
     console.error("[DB] Initial MongoDB connection failed:", err.message);

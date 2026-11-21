@@ -9,6 +9,7 @@ This repository contains the **Express 5 + MongoDB** REST API server powering au
 ## Live API URL
 
 - **Backend Live URL:** [https://bhara-dei-com-backend.vercel.app](https://bhara-dei-com-backend.vercel.app)
+- **Frontend Live URL:** [https://bharadei-com-frontend.vercel.app](https://bharadei-com-frontend.vercel.app)
 - **Health Check:** `GET /api/health`
 
 ---
