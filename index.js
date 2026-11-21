@@ -1698,7 +1698,220 @@ app.get(
 );
 
 // ---------------------------------------------------------------------------
-// 9. 404 & Global Error Handlers
+// 9. Owner Dashboard & Analytics Routes (Challenge 3 Part A)
+// ---------------------------------------------------------------------------
+app.post(
+  "/api/owner/equipment",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const {
+      name,
+      description,
+      category,
+      location,
+      rentalPrice,
+      rentalType = "Daily",
+      availableQuantity,
+      condition = "Good",
+      brand = "",
+      model = "",
+      image = "",
+      rentalTerms = "",
+    } = req.body || {};
+
+    if (
+      !name?.trim() ||
+      !description?.trim() ||
+      !category?.trim() ||
+      !location?.trim() ||
+      !image?.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Equipment name, description, category, location, and image are required.",
+      });
+    }
+
+    const priceNum = Number(rentalPrice);
+    const qtyNum = Number(availableQuantity);
+    if (Number.isNaN(priceNum) || priceNum <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Rental price must be greater than 0.",
+      });
+    }
+    if (!Number.isInteger(qtyNum) || qtyNum < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Available quantity must be a valid non-negative integer.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const now = new Date();
+    const doc = {
+      name: name.trim(),
+      description: description.trim(),
+      category: category.trim(),
+      location: location.trim(),
+      rentalPrice: priceNum,
+      rentalType: ["Daily", "Weekly", "Monthly"].includes(rentalType)
+        ? rentalType
+        : "Daily",
+      availableQuantity: qtyNum,
+      condition: condition.trim(),
+      brand: brand.trim(),
+      model: model.trim(),
+      image: image.trim(),
+      rentalTerms: rentalTerms.trim(),
+      status: "Pending",
+      ownerName: req.user.name,
+      ownerEmail: req.user.email,
+      ownerPhone: req.user.phone || "",
+      rentalCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await equipmentCol.insertOne(doc);
+    return res.status(201).json({
+      success: true,
+      message: "Equipment submitted for admin approval (Status: Pending).",
+      equipment: serializeEquipment({ ...doc, _id: result.insertedId }),
+    });
+  })
+);
+
+app.get(
+  "/api/owner/equipment",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const docs = await equipmentCol
+      .find({ ownerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      items: docs.map(serializeEquipment),
+    });
+  })
+);
+
+app.put(
+  "/api/owner/equipment/:id",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid equipment ID.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const existing = await equipmentCol.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Equipment listing not found.",
+      });
+    }
+    if (existing.ownerEmail !== req.user.email) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only update your own equipment.",
+      });
+    }
+
+    const body = req.body || {};
+    const updates = { updatedAt: new Date() };
+    const stringFields = [
+      "name",
+      "description",
+      "category",
+      "location",
+      "rentalType",
+      "condition",
+      "brand",
+      "model",
+      "image",
+      "rentalTerms",
+    ];
+    for (const key of stringFields) {
+      if (typeof body[key] === "string" && body[key].trim()) {
+        updates[key] = body[key].trim();
+      }
+    }
+    if (body.rentalPrice !== undefined && Number(body.rentalPrice) > 0) {
+      updates.rentalPrice = Number(body.rentalPrice);
+    }
+    if (
+      body.availableQuantity !== undefined &&
+      Number.isInteger(Number(body.availableQuantity)) &&
+      Number(body.availableQuantity) >= 0
+    ) {
+      updates.availableQuantity = Number(body.availableQuantity);
+    }
+
+    const updated = await equipmentCol.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Equipment updated successfully.",
+      equipment: serializeEquipment(updated),
+    });
+  })
+);
+
+app.delete(
+  "/api/owner/equipment/:id",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid equipment ID.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const existing = await equipmentCol.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Equipment listing not found.",
+      });
+    }
+    if (existing.ownerEmail !== req.user.email) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: You can only delete your own equipment.",
+      });
+    }
+
+    await equipmentCol.deleteOne({ _id: new ObjectId(id) });
+    return res.status(200).json({
+      success: true,
+      message: "Equipment deleted successfully.",
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 10. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
