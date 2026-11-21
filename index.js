@@ -2332,6 +2332,182 @@ app.delete(
   })
 );
 
+app.get(
+  "/api/admin/rentals",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const parsedPage = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const parsedLimit = Math.min(25, Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10));
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const total = await bookingsCol.countDocuments({});
+    const totalPages = Math.max(1, Math.ceil(total / parsedLimit));
+    const safePage = Math.min(parsedPage, totalPages);
+
+    const docs = await bookingsCol
+      .find({})
+      .sort({ bookingDate: -1, createdAt: -1 })
+      .skip((safePage - 1) * parsedLimit)
+      .limit(parsedLimit)
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      rentals: docs.map((b) => ({
+        id: String(b._id),
+        customerName: b.customerName,
+        customerEmail: b.customerEmail,
+        contactNumber: b.contactNumber || "",
+        ownerName: b.ownerName || "Owner",
+        ownerEmail: b.ownerEmail || "",
+        equipmentId: b.equipmentId,
+        equipmentName: b.equipmentName,
+        startDate: b.startDate,
+        endDate: b.endDate,
+        days: Number(b.days || 1),
+        quantity: Number(b.quantity || 1),
+        totalAmount: Number(b.totalAmount || 0),
+        paymentStatus: b.paymentStatus || "Pending",
+        bookingStatus: b.bookingStatus || "Pending",
+        bookingDate: b.bookingDate || b.createdAt,
+      })),
+      pagination: { total, page: safePage, limit: parsedLimit, totalPages },
+    });
+  })
+);
+
+app.patch(
+  "/api/admin/rentals/:id/status",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { bookingStatus } = req.body || {};
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID." });
+    }
+    if (!["Pending", "Confirmed", "Completed", "Cancelled"].includes(bookingStatus)) {
+      return res.status(400).json({ success: false, message: "Invalid booking status." });
+    }
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const existing = await bookingsCol.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Booking not found." });
+    }
+
+    const updated = await bookingsCol.findOneAndUpdate(
+      { _id: existing._id },
+      { $set: { bookingStatus, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    if (
+      bookingStatus === "Completed" &&
+      existing.bookingStatus !== "Completed" &&
+      ObjectId.isValid(existing.equipmentId)
+    ) {
+      await equipmentCol.updateOne(
+        { _id: new ObjectId(existing.equipmentId) },
+        {
+          $inc: { availableQuantity: Number(existing.quantity || 1) },
+          $set: { updatedAt: new Date() },
+        }
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Booking status updated to ${bookingStatus}.`,
+      rental: { id: String(updated._id), ...updated },
+    });
+  })
+);
+
+app.get(
+  "/api/admin/analytics",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (_req, res) => {
+    const [usersCol, equipmentCol, bookingsCol, paymentsCol] = await Promise.all([
+      getCollection(COLLECTIONS.USERS),
+      getCollection(COLLECTIONS.EQUIPMENT),
+      getCollection(COLLECTIONS.BOOKINGS),
+      getCollection(COLLECTIONS.PAYMENTS),
+    ]);
+
+    const [allUsers, allEquipment, allBookings, allPayments] = await Promise.all([
+      usersCol.find({}, { projection: { role: 1 } }).toArray(),
+      equipmentCol.find({}, { projection: { status: 1, category: 1 } }).toArray(),
+      bookingsCol.find({}).toArray(),
+      paymentsCol.find({ paymentStatus: "Paid" }).toArray(),
+    ]);
+
+    const totalUsers = allUsers.length;
+    const totalEquipment = allEquipment.length;
+    const totalBookings = allBookings.length;
+    const pendingApprovals = allEquipment.filter((e) => e.status === "Pending").length;
+    const completedRentals = allBookings.filter((b) => b.bookingStatus === "Completed").length;
+
+    const totalRevenue = allPayments.length
+      ? allPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+      : allBookings
+          .filter((b) => b.paymentStatus === "Paid")
+          .reduce((sum, b) => sum + Number(b.totalAmount || 0), 0);
+
+    const buckets = buildMonthlyBuckets(6).map((b) => ({
+      key: b.key,
+      month: b.month,
+      bookings: 0,
+      revenue: 0,
+    }));
+    const bucketMap = new Map(buckets.map((b) => [b.key, b]));
+
+    for (const b of allBookings) {
+      const dt = new Date(b.bookingDate || b.createdAt);
+      if (!Number.isNaN(dt.getTime())) {
+        const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+        const bucket = bucketMap.get(key);
+        if (bucket) {
+          bucket.bookings += 1;
+          if (b.paymentStatus === "Paid") {
+            bucket.revenue += Number(b.totalAmount || 0);
+          }
+        }
+      }
+    }
+
+    const roleBreakdown = ["Customer", "Owner", "Admin"].map((role) => ({
+      role,
+      count: allUsers.filter((u) => (u.role || "Customer") === role).length,
+    }));
+
+    const equipmentStatusBreakdown = ["Approved", "Pending", "Rejected"].map(
+      (status) => ({
+        status,
+        count: allEquipment.filter((e) => e.status === status).length,
+      })
+    );
+
+    return res.status(200).json({
+      success: true,
+      analytics: {
+        totalUsers,
+        totalEquipment,
+        totalBookings,
+        pendingApprovals,
+        completedRentals,
+        totalRevenue,
+        monthlyStats: buckets,
+        roleBreakdown,
+        equipmentStatusBreakdown,
+      },
+    });
+  })
+);
+
 // ---------------------------------------------------------------------------
 // 11. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
