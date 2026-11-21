@@ -1910,6 +1910,190 @@ app.delete(
   })
 );
 
+function buildMonthlyBuckets(monthsCount = 6) {
+  const buckets = [];
+  const now = new Date();
+  for (let i = monthsCount - 1; i >= 0; i -= 1) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const label = d.toLocaleString("en-US", { month: "short", year: "2-digit" });
+    buckets.push({ key, month: label, earnings: 0, bookings: 0 });
+  }
+  return buckets;
+}
+
+app.get(
+  "/api/owner/rentals",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const parsedPage = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const parsedLimit = Math.min(25, Math.max(1, parseInt(String(req.query.limit || "10"), 10) || 10));
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const filter = { ownerEmail: req.user.email };
+    const total = await bookingsCol.countDocuments(filter);
+    const totalPages = Math.max(1, Math.ceil(total / parsedLimit));
+    const safePage = Math.min(parsedPage, totalPages);
+
+    const docs = await bookingsCol
+      .find(filter)
+      .sort({ bookingDate: -1, createdAt: -1 })
+      .skip((safePage - 1) * parsedLimit)
+      .limit(parsedLimit)
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      rentals: docs.map((b) => ({
+        id: String(b._id),
+        customerName: b.customerName,
+        customerEmail: b.customerEmail,
+        contactNumber: b.contactNumber || "",
+        deliveryAddress: b.deliveryAddress || "",
+        equipmentId: b.equipmentId,
+        equipmentName: b.equipmentName,
+        equipmentCategory: b.equipmentCategory || "",
+        startDate: b.startDate,
+        endDate: b.endDate,
+        days: Number(b.days || 1),
+        quantity: Number(b.quantity || 1),
+        totalAmount: Number(b.totalAmount || 0),
+        paymentStatus: b.paymentStatus || "Pending",
+        bookingStatus: b.bookingStatus || "Pending",
+        bookingDate: b.bookingDate || b.createdAt,
+      })),
+      pagination: { total, page: safePage, limit: parsedLimit, totalPages },
+    });
+  })
+);
+
+app.patch(
+  "/api/owner/rentals/:id/status",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { bookingStatus } = req.body || {};
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID." });
+    }
+    if (!["Confirmed", "Completed", "Cancelled"].includes(bookingStatus)) {
+      return res.status(400).json({ success: false, message: "Invalid booking status." });
+    }
+
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const existing = await bookingsCol.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Booking not found." });
+    }
+    if (existing.ownerEmail !== req.user.email) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Booking does not belong to your equipment.",
+      });
+    }
+
+    const updated = await bookingsCol.findOneAndUpdate(
+      { _id: existing._id },
+      { $set: { bookingStatus, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    if (
+      bookingStatus === "Completed" &&
+      existing.bookingStatus !== "Completed" &&
+      ObjectId.isValid(existing.equipmentId)
+    ) {
+      await equipmentCol.updateOne(
+        { _id: new ObjectId(existing.equipmentId) },
+        {
+          $inc: { availableQuantity: Number(existing.quantity || 1) },
+          $set: { updatedAt: new Date() },
+        }
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Booking marked as ${bookingStatus}.`,
+      rental: { id: String(updated._id), ...updated },
+    });
+  })
+);
+
+app.get(
+  "/api/owner/analytics",
+  verifyToken,
+  verifyOwner,
+  asyncHandler(async (req, res) => {
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const paymentsCol = await getCollection(COLLECTIONS.PAYMENTS);
+
+    const [myEquipment, myBookings, myPayments] = await Promise.all([
+      equipmentCol.find({ ownerEmail: req.user.email }).toArray(),
+      bookingsCol.find({ ownerEmail: req.user.email }).toArray(),
+      paymentsCol.find({ ownerEmail: req.user.email, paymentStatus: "Paid" }).toArray(),
+    ]);
+
+    const totalListedEquipment = myEquipment.length;
+    const approvedEquipment = myEquipment.filter((e) => e.status === "Approved").length;
+    const pendingEquipment = myEquipment.filter((e) => e.status === "Pending").length;
+    const completedRentals = myBookings.filter((b) => b.bookingStatus === "Completed").length;
+    const activeRentals = myBookings.filter((b) => b.bookingStatus === "Confirmed").length;
+
+    // Combine paid payments (authoritative) or fallback to paid bookings if payments collection lacks legacy entry
+    const totalEarnings = myPayments.length
+      ? myPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0)
+      : myBookings
+          .filter((b) => b.paymentStatus === "Paid")
+          .reduce((sum, b) => sum + Number(b.totalAmount || 0), 0);
+
+    const buckets = buildMonthlyBuckets(6);
+    const bucketMap = new Map(buckets.map((b) => [b.key, b]));
+
+    for (const b of myBookings) {
+      const dt = new Date(b.bookingDate || b.createdAt);
+      if (!Number.isNaN(dt.getTime())) {
+        const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+        const bucket = bucketMap.get(key);
+        if (bucket) {
+          bucket.bookings += 1;
+          if (b.paymentStatus === "Paid") {
+            bucket.earnings += Number(b.totalAmount || 0);
+          }
+        }
+      }
+    }
+
+    const catMap = new Map();
+    for (const eq of myEquipment) {
+      catMap.set(eq.category, (catMap.get(eq.category) || 0) + 1);
+    }
+    const categoryBreakdown = Array.from(catMap.entries()).map(([category, count]) => ({
+      category,
+      count,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      analytics: {
+        totalListedEquipment,
+        approvedEquipment,
+        pendingEquipment,
+        totalBookings: myBookings.length,
+        activeRentals,
+        completedRentals,
+        totalEarnings,
+        monthlyEarnings: buckets,
+        categoryBreakdown,
+      },
+    });
+  })
+);
+
 // ---------------------------------------------------------------------------
 // 10. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
