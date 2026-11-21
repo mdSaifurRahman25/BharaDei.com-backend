@@ -5,6 +5,8 @@ import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import Stripe from "stripe";
+import cron from "node-cron";
+import nodemailer from "nodemailer";
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
@@ -2015,6 +2017,10 @@ app.patch(
       );
     }
 
+    if (bookingStatus === "Completed" && existing.bookingStatus !== "Completed") {
+      void sendBookingCompletionEmail(updated).catch(() => {});
+    }
+
     return res.status(200).json({
       success: true,
       message: `Booking marked as ${bookingStatus}.`,
@@ -2509,7 +2515,113 @@ app.get(
 );
 
 // ---------------------------------------------------------------------------
-// 11. 404 & Global Error Handlers
+// 11. Bonus Automation (Cron Job & Email Notifications)
+// ---------------------------------------------------------------------------
+function getMailTransporter() {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return null;
+  }
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: Number(process.env.SMTP_PORT || 587) === 465,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+}
+
+async function sendBookingCompletionEmail(booking) {
+  const transporter = getMailTransporter();
+  if (!transporter) {
+    return { sent: false, reason: "SMTP not configured" };
+  }
+
+  const subject = `BharaDei.com — Rental Completed: ${booking.equipmentName}`;
+  const summaryText = `Hello,\n\nThe rental booking for "${booking.equipmentName}" (${new Date(
+    booking.startDate
+  ).toLocaleDateString()} to ${new Date(
+    booking.endDate
+  ).toLocaleDateString()}) has been marked as Completed.\nTotal Amount: BDT ${Number(
+    booking.totalAmount || 0
+  ).toLocaleString()}\n\nThank you for using BharaDei.com!`;
+
+  const recipients = [booking.customerEmail, booking.ownerEmail].filter(Boolean);
+  await Promise.allSettled(
+    recipients.map((to) =>
+      transporter.sendMail({
+        from: process.env.SMTP_USER,
+        to,
+        subject,
+        text: summaryText,
+      })
+    )
+  );
+  return { sent: true };
+}
+
+async function completeExpiredRentals() {
+  try {
+    const bookingsCol = await getCollection(COLLECTIONS.BOOKINGS);
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const expired = await bookingsCol
+      .find({
+        bookingStatus: "Confirmed",
+        paymentStatus: "Paid",
+        endDate: { $lt: startOfToday },
+      })
+      .toArray();
+
+    for (const booking of expired) {
+      await bookingsCol.updateOne(
+        { _id: booking._id },
+        { $set: { bookingStatus: "Completed", updatedAt: new Date() } }
+      );
+      if (ObjectId.isValid(booking.equipmentId)) {
+        await equipmentCol.updateOne(
+          { _id: new ObjectId(booking.equipmentId) },
+          {
+            $inc: { availableQuantity: Number(booking.quantity || 1) },
+            $set: { updatedAt: new Date() },
+          }
+        );
+      }
+      await sendBookingCompletionEmail(booking).catch(() => {});
+    }
+
+    return expired.length;
+  } catch (err) {
+    console.warn("[Cron] Auto-complete skipped:", err.message);
+    return 0;
+  }
+}
+
+if (!process.env.VERCEL && process.env.NODE_ENV !== "test") {
+  cron.schedule("0 * * * *", () => {
+    void completeExpiredRentals();
+  });
+}
+
+app.post(
+  "/api/cron/complete-expired-rentals",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (_req, res) => {
+    const updatedCount = await completeExpiredRentals();
+    return res.status(200).json({
+      success: true,
+      message: `Processed expired bookings: ${updatedCount} marked Completed.`,
+      updatedCount,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 12. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
