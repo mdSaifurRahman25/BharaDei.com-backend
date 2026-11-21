@@ -2095,7 +2095,245 @@ app.get(
 );
 
 // ---------------------------------------------------------------------------
-// 10. 404 & Global Error Handlers
+// 10. Admin Dashboard & Analytics Routes (Challenge 3 Part B)
+// ---------------------------------------------------------------------------
+app.get(
+  "/api/admin/users",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (_req, res) => {
+    const usersCol = await getCollection(COLLECTIONS.USERS);
+    const docs = await usersCol
+      .find({}, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      users: docs.map(sanitizeUser),
+    });
+  })
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { role } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID." });
+    }
+    if (!["Customer", "Owner", "Admin"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Role must be Customer, Owner, or Admin.",
+      });
+    }
+    if (id === req.user.id && role !== "Admin") {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot demote your own currently active Admin account.",
+      });
+    }
+
+    const usersCol = await getCollection(COLLECTIONS.USERS);
+    const updated = await usersCol.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { role, updatedAt: new Date() } },
+      { returnDocument: "after", projection: { password: 0 } }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `User role updated to ${role}.`,
+      user: sanitizeUser(updated),
+    });
+  })
+);
+
+app.delete(
+  "/api/admin/users/:id",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID." });
+    }
+    if (id === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot delete your own active Admin account.",
+      });
+    }
+
+    const usersCol = await getCollection(COLLECTIONS.USERS);
+    const result = await usersCol.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "User account removed.",
+    });
+  })
+);
+
+app.get(
+  "/api/admin/equipment",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const statusFilter = String(req.query.status || "").trim();
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+
+    const query = {};
+    if (["Pending", "Approved", "Rejected"].includes(statusFilter)) {
+      query.status = statusFilter;
+    }
+
+    const docs = await equipmentCol
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      items: docs.map(serializeEquipment),
+    });
+  })
+);
+
+app.patch(
+  "/api/admin/equipment/:id/status",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid equipment ID." });
+    }
+    if (!["Pending", "Approved", "Rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be Pending, Approved, or Rejected.",
+      });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const updated = await equipmentCol.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Equipment not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Equipment status updated to ${status}.`,
+      equipment: serializeEquipment(updated),
+    });
+  })
+);
+
+app.put(
+  "/api/admin/equipment/:id",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid equipment ID." });
+    }
+
+    const body = req.body || {};
+    const updates = { updatedAt: new Date() };
+    const stringFields = [
+      "name",
+      "description",
+      "category",
+      "location",
+      "rentalType",
+      "condition",
+      "brand",
+      "model",
+      "image",
+      "rentalTerms",
+      "status",
+    ];
+    for (const key of stringFields) {
+      if (typeof body[key] === "string" && body[key].trim()) {
+        updates[key] = body[key].trim();
+      }
+    }
+    if (body.rentalPrice !== undefined && Number(body.rentalPrice) > 0) {
+      updates.rentalPrice = Number(body.rentalPrice);
+    }
+    if (
+      body.availableQuantity !== undefined &&
+      Number.isInteger(Number(body.availableQuantity)) &&
+      Number(body.availableQuantity) >= 0
+    ) {
+      updates.availableQuantity = Number(body.availableQuantity);
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const updated = await equipmentCol.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Equipment not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Equipment updated successfully.",
+      equipment: serializeEquipment(updated),
+    });
+  })
+);
+
+app.delete(
+  "/api/admin/equipment/:id",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid equipment ID." });
+    }
+
+    const equipmentCol = await getCollection(COLLECTIONS.EQUIPMENT);
+    const result = await equipmentCol.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Equipment not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Equipment deleted successfully.",
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 11. 404 & Global Error Handlers
 // ---------------------------------------------------------------------------
 app.use((req, res) => {
   res.status(404).json({
